@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import copy
 import json
 import socket
 import ssl
@@ -53,7 +54,108 @@ SPECIAL_CHARS_LIST = [
     "${7*7}",
 ]
 
+PAYLOAD_ENGINES = {
+    "SQLInjection": {
+        "severity": "HIGH",
+        "payloads": [
+            "' OR '1'='1",
+            "\" OR \"1\"=\"1",
+            "' UNION SELECT NULL--",
+            "'; WAITFOR DELAY '0:0:3'--",
+        ],
+        "error_signatures": [
+            "sql syntax",
+            "syntax error at or near",
+            "unterminated quoted string",
+            "sqlite",
+            "mysql",
+            "postgresql",
+            "sqlstate",
+            "ora-",
+        ],
+        "reflection_tokens": ["' OR '1'='1", "UNION SELECT"],
+    },
+    "NoSQLInjection": {
+        "severity": "HIGH",
+        "payloads": [
+            '{"$ne": null}',
+            '{"$gt": ""}',
+            '{"$regex": ".*"}',
+        ],
+        "error_signatures": ["mongodb", "bson", "nosql", "mongoerror"],
+        "reflection_tokens": ['"$ne"', '"$regex"'],
+    },
+    "XSS": {
+        "severity": "HIGH",
+        "payloads": [
+            "<script>alert(1337)</script>",
+            "\"><img src=x onerror=alert(1)>",
+            "<svg/onload=alert(1)>",
+        ],
+        "error_signatures": [],
+        "reflection_tokens": ["<script>alert(1337)</script>", "onerror=alert(1)", "onload=alert(1)"],
+    },
+    "SSTI": {
+        "severity": "HIGH",
+        "payloads": [
+            "{{7*7}}",
+            "${7*7}",
+            "<%= 7*7 %>",
+        ],
+        "error_signatures": ["jinja", "template", "mustache", "twig", "handlebars"],
+        "reflection_tokens": ["49", "{{7*7}}", "${7*7}"],
+    },
+    "CommandInjection": {
+        "severity": "CRITICAL",
+        "payloads": [
+            ";id",
+            "&& whoami",
+            "| cat /etc/passwd",
+        ],
+        "error_signatures": ["uid=", "gid=", "root:x:", "command not found", "sh:"],
+        "reflection_tokens": ["uid=", "gid=", "root:x:"],
+    },
+    "PathTraversal": {
+        "severity": "HIGH",
+        "payloads": [
+            "../../../../etc/passwd",
+            "..\\..\\..\\windows\\win.ini",
+            "..%2f..%2f..%2f..%2fetc%2fpasswd",
+        ],
+        "error_signatures": ["no such file or directory", "access is denied", "permission denied"],
+        "reflection_tokens": ["root:x:", "[fonts]", "for 16-bit app support"],
+    },
+    "CRLFInjection": {
+        "severity": "MEDIUM",
+        "payloads": [
+            "%0d%0aX-Injection-Test: alpaca",
+            "\r\nX-Injection-Test: alpaca",
+        ],
+        "error_signatures": [],
+        "reflection_tokens": ["x-injection-test", "alpaca"],
+    },
+    "OpenRedirect": {
+        "severity": "HIGH",
+        "payloads": [
+            "https://evil.example/path",
+            "//evil.example/path",
+        ],
+        "error_signatures": [],
+        "reflection_tokens": ["evil.example/path"],
+    },
+}
+
 ALTERNATE_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"]
+
+SEVERITY_WEIGHTS = {
+    "CRITICAL": 40,
+    "HIGH": 20,
+    "MEDIUM": 8,
+    "LOW": 3,
+    "INFO": 0,
+}
+
+MAX_MUTATIONS_PER_PAYLOAD = 4
 
 SEVERITY_COLORS = {
     "CRITICAL": RED,
@@ -65,22 +167,36 @@ SEVERITY_COLORS = {
 
 
 def print_banner():
-    alpaca = r"""
-                    /\
-               /\  //\\
-        /\    //\\///\\\        /\
-       //\\  ///\////\\\\  /\  //\\
-  /\  /  ^ \/^ ^/^  ^  ^ \/^ \/  ^ \
- / ^\/^ ^   ^  ^    ^   ^ \ ^/  ^  ^\
-/^   \^ /\  ^    ^  ^   ^   \/^   ^  \
-    /\  /\ \              ^    ^  /\
-   /  \/  \ \                   /  \
-  /           \_    VULN ALPACA _/
+    robot = """
+██╗   ██╗██╗   ██╗██╗     ███╗   ██╗██╗     ███████╗ █████╗ ██████╗ ███╗   ██╗
+██║   ██║██║   ██║██║     ████╗  ██║██║     ██╔════╝██╔══██╗██╔══██╗████╗  ██║
+██║   ██║██║   ██║██║     ██╔██╗ ██║██║     █████╗  ███████║██████╔╝██╔██╗ ██║
+╚██╗ ██╔╝██║   ██║██║     ██║╚██╗██║██║     ██╔══╝  ██╔══██║██╔══██╗██║╚██╗██║
+ ╚████╔╝ ╚██████╔╝███████╗██║ ╚████║███████╗███████╗██║  ██║██║  ██║██║ ╚████║
+  ╚═══╝   ╚═════╝ ╚══════╝╚═╝  ╚═══╝╚══════╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝
+                                                                              
+───────────────────────────────────────
+───▐▀▄───────▄▀▌───▄▄▄▄▄▄▄─────────────
+───▌▒▒▀▄▄▄▄▄▀▒▒▐▄▀▀▒██▒██▒▀▀▄──────────
+──▐▒▒▒▒▀▒▀▒▀▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▀▄────────
+──▌▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▄▒▒▒▒▒▒▒▒▒▒▒▒▀▄──────
+▀█▒▒▒█▌▒▒█▒▒▐█▒▒▒▀▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▌─────
+▀▌▒▒▒▒▒▒▀▒▀▒▒▒▒▒▒▀▀▒▒▒▒▒▒▒▒▒▒▒▒▒▒▐───▄▄
+▐▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▌▄█▒█
+▐▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒█▒█▀─
+▐▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒█▀───
+▐▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▌────
+─▌▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▐─────
+─▐▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▌─────
+──▌▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▐──────
+──▐▄▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▄▌──────
+────▀▄▄▀▀▀▀▀▄▄▀▀▀▀▀▀▀▄▄▀▀▀▀▀▄▄▀────────
+
  """
 
-    title = "VulnLAPI - DAST Lite"
+    title = "VulnLearn - DAST Lite"
 
-    print(MAGENTA + alpaca + RESET)
+    print(MAGENTA + robot + RESET)
     print(CYAN + BOLD + title + RESET)
     print(YELLOW + "=" * 88 + RESET)
     print(GREEN + "Escaneo educativo de APIs con reporte estructurado." + RESET)
@@ -108,6 +224,133 @@ def response_json(resp):
         return resp.json()
     except Exception:
         return None
+
+
+def collect_string_paths(value, trail=None):
+    trail = trail or []
+    if isinstance(value, str):
+        return [tuple(trail)]
+
+    paths = []
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            paths.extend(collect_string_paths(nested, trail + [key]))
+    elif isinstance(value, list):
+        for idx, nested in enumerate(value):
+            paths.extend(collect_string_paths(nested, trail + [idx]))
+
+    return paths
+
+
+def get_path_value(container, trail):
+    current = container
+    for step in trail:
+        current = current[step]
+    return current
+
+
+def set_path_value(container, trail, new_value):
+    current = container
+    for step in trail[:-1]:
+        current = current[step]
+    current[trail[-1]] = new_value
+
+
+def format_path(trail):
+    formatted = []
+    for step in trail:
+        if isinstance(step, int):
+            formatted.append(f"[{step}]")
+        else:
+            formatted.append(step)
+    return ".".join(formatted).replace(".[", "[")
+
+
+def build_body_mutations(data, payload):
+    if not isinstance(data, dict):
+        return []
+
+    paths = collect_string_paths(data)
+    mutations = []
+
+    if not paths:
+        test_data = copy.deepcopy(data)
+        test_data["dastProbe"] = payload
+        return [("body.dastProbe", test_data)]
+
+    for path in paths:
+        test_data = copy.deepcopy(data)
+        original = get_path_value(test_data, path)
+        set_path_value(test_data, path, f"{original}{payload}")
+        mutations.append((f"body.{format_path(path)}", test_data))
+        if len(mutations) >= MAX_MUTATIONS_PER_PAYLOAD:
+            break
+
+    return mutations
+
+
+def build_query_mutations(endpoint, payload):
+    parsed = urllib.parse.urlparse(endpoint)
+    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    mutations = []
+
+    if not query:
+        query = {"q": [payload]}
+        new_query = urllib.parse.urlencode(query, doseq=True)
+        new_endpoint = urllib.parse.urlunparse(parsed._replace(query=new_query))
+        return [("query.q", new_endpoint)]
+
+    for key in query:
+        test_query = copy.deepcopy(query)
+        current = test_query[key][0] if test_query[key] else ""
+        test_query[key] = [f"{current}{payload}"]
+        new_query = urllib.parse.urlencode(test_query, doseq=True)
+        new_endpoint = urllib.parse.urlunparse(parsed._replace(query=new_query))
+        mutations.append((f"query.{key}", new_endpoint))
+        if len(mutations) >= MAX_MUTATIONS_PER_PAYLOAD:
+            break
+
+    return mutations
+
+
+def detect_payload_anomaly(engine_name, config, payload, baseline, resp):
+    signals = []
+
+    if not resp:
+        return signals
+
+    baseline_status = baseline.status_code if baseline else None
+    response_text = (resp.text or "").lower()
+    baseline_text = (baseline.text or "").lower() if baseline else ""
+
+    if resp.status_code >= 500 and (baseline_status is None or baseline_status < 500):
+        signals.append(f"status inesperado {resp.status_code}")
+
+    new_errors = [
+        signature
+        for signature in config.get("error_signatures", [])
+        if signature in response_text and signature not in baseline_text
+    ]
+    if new_errors:
+        signals.append("errores sensibles detectados: " + ", ".join(new_errors[:3]))
+
+    new_reflections = [
+        token
+        for token in config.get("reflection_tokens", [])
+        if token.lower() in response_text and token.lower() not in baseline_text
+    ]
+    if new_reflections:
+        signals.append("payload/tokens reflejados en respuesta")
+
+    if engine_name == "OpenRedirect":
+        location = (resp.headers.get("Location") or "").lower()
+        if resp.status_code in [301, 302, 303, 307, 308] and "evil.example" in location:
+            signals.append(f"redireccion abierta detectada hacia {location}")
+
+    if baseline_status and baseline_status != resp.status_code and resp.status_code < 500:
+        signals.append(f"status cambio {baseline_status}->{resp.status_code}")
+
+    return signals
 
 
 def send_request(session, host, endpoint, method, headers=None, data=None):
@@ -152,6 +395,50 @@ def print_finding(index, finding):
     print(f"    {GREY}Evidencia:{RESET} {finding['evidence']}")
     print(f"    {GREEN}Recomendacion:{RESET} {finding['recommendation']}")
     print(GREY + "-" * 88 + RESET)
+
+
+def test_payload_engines(session, host, endpoint, method, headers, data):
+    findings = []
+    req_method = method.upper()
+    baseline = send_request(session, host, endpoint, req_method, headers, data)
+
+    for engine_name, config in PAYLOAD_ENGINES.items():
+        detected = False
+        for payload in config.get("payloads", []):
+            variations = []
+            variations.extend([(vector, endpoint, body) for vector, body in build_body_mutations(data, payload)])
+            variations.extend([(vector, ep, data) for vector, ep in build_query_mutations(endpoint, payload)])
+
+            if not variations:
+                continue
+
+            for vector, test_endpoint, test_data in variations[:MAX_MUTATIONS_PER_PAYLOAD]:
+                resp = send_request(session, host, test_endpoint, req_method, headers, test_data)
+                if not resp:
+                    continue
+
+                signals = detect_payload_anomaly(engine_name, config, payload, baseline, resp)
+                if not signals:
+                    continue
+
+                findings.append(
+                    make_finding(
+                        f"PayloadEngine:{engine_name}",
+                        config.get("severity", "MEDIUM"),
+                        test_endpoint,
+                        payload,
+                        resp.status_code,
+                        f"{vector} -> {' | '.join(signals)}",
+                        "Aplicar validacion estricta, normalizar entrada y usar consultas/plantillas seguras segun el tipo de inyeccion.",
+                    )
+                )
+                detected = True
+                break
+
+            if detected:
+                break
+
+    return findings
 
 
 def test_method_override(session, host, endpoint, method, headers, data):
@@ -458,6 +745,33 @@ def test_security_headers(session, host, endpoint, method, headers, data):
     ]
 
 
+def severity_rank(level):
+    order = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1}
+    return order.get(level.upper(), 0)
+
+
+def bar_meter(value, total, width=30):
+    safe_total = max(total, 1)
+    ratio = max(0, min(1, value / safe_total))
+    filled = int(ratio * width)
+    return "[" + "#" * filled + "." * (width - filled) + "]"
+
+
+def calculate_risk(findings):
+    score = 0
+    for finding in findings:
+        score += SEVERITY_WEIGHTS.get(finding["severity"].upper(), 0)
+    score = min(score, 100)
+
+    if score >= 70:
+        return score, "SUPERFICIE DE RIESGO ALTA", RED
+    if score >= 35:
+        return score, "SUPERFICIE DE RIESGO MEDIA", YELLOW
+    if score > 0:
+        return score, "SUPERFICIE DE RIESGO BAJA", CYAN
+    return score, "SIN INDICIOS DE RIESGO EN PRUEBAS ACTUALES", GREEN
+
+
 def print_summary(host, endpoint, method, findings, started_at):
     elapsed = time.time() - started_at
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -478,10 +792,31 @@ def print_summary(host, endpoint, method, findings, started_at):
     print(f"{BLUE}Metodo:{RESET} {method}")
     print(f"{BLUE}Tiempo total:{RESET} {elapsed:.2f}s")
 
+    total_findings = len(findings)
+    risk_score, risk_label, risk_color = calculate_risk(findings)
+
+    print("\n" + YELLOW + "+" + "-" * 86 + "+" + RESET)
+    print(CYAN + BOLD + "Panel Ejecutivo" + RESET)
+    print(YELLOW + "+" + "-" * 86 + "+" + RESET)
+    print(f"{BLUE}Hallazgos totales:{RESET} {total_findings}")
+    print(f"{BLUE}Riesgo acumulado:{RESET} {risk_score}/100 {bar_meter(risk_score, 100)}")
+    print(f"{BLUE}Postura:{RESET} {risk_color}{BOLD}{risk_label}{RESET}")
+
     print("\n" + BOLD + "Resumen por severidad" + RESET)
     for level in severity_order:
         color = severity_color(level)
-        print(f"  {color}{level:<8}{RESET}: {counters[level]}")
+        meter = bar_meter(counters[level], total_findings if total_findings else 1, width=22)
+        print(f"  {color}{level:<8}{RESET}: {counters[level]:>3} {meter}")
+
+    if findings:
+        print("\n" + BOLD + "Top Hallazgos" + RESET)
+        sorted_findings = sorted(findings, key=lambda item: severity_rank(item["severity"]), reverse=True)
+        for idx, finding in enumerate(sorted_findings[:5], start=1):
+            sev_color = severity_color(finding["severity"])
+            print(
+                f"  {idx}. {sev_color}{finding['severity']:<8}{RESET} "
+                f"{finding['module']} | {finding['tested_endpoint']}"
+            )
 
     print("\n" + BOLD + "Detalle de hallazgos" + RESET)
     if not findings:
@@ -493,6 +828,7 @@ def print_summary(host, endpoint, method, findings, started_at):
 
 def collect_findings(session, host, endpoint, method, headers, data):
     modules = [
+        ("PayloadEngines", test_payload_engines),
         ("MethodOverride", test_method_override),
         ("WeakInputHandling", test_weak_input),
         ("ServerHeader", test_server_header),
